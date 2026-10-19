@@ -1,38 +1,29 @@
-# Football Intelligence AI — etap 1 (bezpłatny prototyp)
+# Football Intelligence AI 0.4 — research release
 
-To **działający prototyp historycznego backtestu**, a nie gotowy system typów na dziś.
+**Not a verified winning betting model.** This is a historical backtest framework.
 
-## Co robi
-- Pobiera publiczne CSV z football-data.co.uk (9 lig, jeśli źródło udostępnia dane).
-- Tworzy cechy **przed** aktualizacją ratingu Elo i formy po meczu.
-- Trenuje regresję logistyczną na sezonach 2023/24–2024/25.
-- Testuje na odłożonym sezonie 2025/26 (nie używa go do trenowania).
-- Raportuje accuracy, wieloklasowy Brier Score i log loss.
-- Zapisuje szczegóły prognoz historycznych do CSV.
+## One-time GitHub installation
 
-## Czego JESZCZE nie robi
-- Nie pobiera xG, absencji, składów, kursów ani terminarza przyszłych meczów.
-- Nie generuje prognoz na dziś ani nie aktualizuje wag automatycznie.
-- Nie ma jeszcze porównania z rynkiem ani pełnej kalibracji.
-- Nie obejmuje Ekstraklasy (potrzebne inne legalne źródło danych).
-- Nie zapisuje wyników między uruchomieniami w repozytorium; pliki wynikowe są artefaktami GitHub Actions przez 30 dni.
+Upload **all files and directories from this ZIP** into the root of `JanBrodka14/football-intelligence-ai`, replacing same-named files. Preserve `.github/workflows/backtest.yml` at that exact path. Delete old `poisson_backtest.py` only after installing this package; v0.4 consolidates the Poisson model into `backtest.py`. `forecast_registry.csv` preserves the original supplied 12 records. Do not overwrite it if your repository contains newer manually verified results; merge instead.
 
-## Uruchomienie w GitHub
-1. Prześlij do repozytorium zawartość paczki **z zachowaniem folderu `.github/workflows/`**.
-2. Wejdź w **Actions** → **Football AI - historical backtest** → **Run workflow**.
-3. Poczekaj na zielony znacznik. Wejdź w wykonanie → **Artifacts** → pobierz `football-ai-backtest`.
-4. Otwórz `metrics.json` i `historical_predictions.csv`.
-5. Jeśli workflow nie pojawia się: upewnij się, że plik `.github/workflows/backtest.yml` jest na domyślnej gałęzi i Actions są włączone.
+Open GitHub → Actions → **Football AI v0.4 - audited backtest** → Run workflow. Download `football-ai-v04-research` artifact, containing `metrics_v04.json`, `predictions_v04.csv`, and `registry_audit.json`.
 
-## Lokalnie (opcjonalnie)
-```bash
-python -m pip install -r requirements.txt
-python download_data.py
-python backtest.py
-```
+## Evaluation protocol
 
-## Zastrzeżenia metodologiczne
-- Podział według sezonów ogranicza leakage między treningiem a testem. Przy tej wersji test ma jeden sezon i nie stanowi jeszcze dowodu przewagi nad rynkiem.
-- Elo jest aktualizowane chronologicznie również dla spotkań w sezonie testowym: to dozwolone, ponieważ wyniki wcześniejszych meczów były znane przed kolejnymi spotkaniami.
-- Cechy obejmują tylko wyniki i formę bramkową, bez xG; nie należy na tej podstawie obstawiać.
-- Dostępność danych i warunki automatycznego pobierania zależą od zewnętrznego dostawcy.
+- 2023/24: initial model training.
+- 2024/25: alpha and Dixon-Coles rho tuning using 1X2 log loss.
+- 2023/24 + 2024/25: refit.
+- 2025/26: diagnostic comparison against Elo baseline and margin-normalized bookmaker probabilities.
+- **2025/26 is already inspected** and cannot be described as a fresh untouched test. Do not choose parameters based on its metrics.
+- Historical matches do not establish pre-match timestamped real-world forecasts. Live fixtures, xG, injuries, odds and automated settlement are NOT implemented.
+- Registry audit never fills in unknown results or silently mixes external model picks into proprietary performance.
+
+## Known issues
+
+- 2024/25 validation may contain teams unseen in 2023/24.
+- Simple independent-goal Poisson plus Dixon-Coles is a baseline, not a calibrated state-of-the-art forecast.
+- Team strength is estimated on season aggregates for held-out season, not continually retrained before each match.
+- Same-day Elo features intentionally do not update from other matches played on the same calendar day.
+- `download_data.py` requires access to football-data.co.uk; the project can also run on already downloaded `data/*.csv`.
+- GitHub Actions checkout/setup-python v4/v5 may emit Node 20 deprecation notices; they do not change numerical predictions, but should be upgraded after verifying action compatibility.
+- Daily ChatGPT scheduled reports are separate from this GitHub workflow.
