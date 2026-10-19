@@ -40,12 +40,33 @@ def main():
     games=load()
     tr=[m for m in games if m['season'] in TRAIN];te=[m for m in games if m['season'] in TEST]
     if len(tr)<200 or len(te)<100: raise SystemExit('Insufficient data for holdout')
+    # Tune regularization using 2023/24 -> 2024/25 ONLY.
+    # alpha=1.0 was excessive for sparse team one-hot features, shrinking
+    # team-specific attack/defense coefficients almost to zero.
+    inner_train=[m for m in tr if m['season']=='2324']
+    inner_valid=[m for m in tr if m['season']=='2425']
+    if not inner_train or not inner_valid:
+        raise SystemExit('Missing inner train/validation seasons')
+    ic,iv,iy=goal_features(inner_train)
+    vc,vv,vy=goal_features(inner_valid)
+    inner_enc=OneHotEncoder(handle_unknown='ignore',sparse_output=True)
+    inner_enc.fit(ic)
+    inner_X=matrix(inner_enc,ic,iv)
+    inner_V=matrix(inner_enc,vc,vv)
+    candidates=[0.0001,0.001,0.01,0.1]
+    validation=[]
+    for alpha in candidates:
+        candidate=PoissonRegressor(alpha=alpha,max_iter=1000,tol=1e-7).fit(inner_X,iy)
+        mu=np.clip(candidate.predict(inner_V),0.05,7.0)
+        dev=float(np.mean(mu-vy*np.log(mu)))  # Poisson NLL without constant log(y!)
+        validation.append({'alpha':alpha,'validation_poisson_nll_no_constant':dev})
+    best=min(validation,key=lambda r:r['validation_poisson_nll_no_constant'])['alpha']
     cat,venue,y=goal_features(tr)
     enc=OneHotEncoder(handle_unknown='ignore',sparse_output=True)
-    # Separate attack and opposition defense, with league-qualified team IDs.
+    # Column 1 encodes attack, column 2 encodes opponent defense.
     enc.fit(cat)
     X=matrix(enc,cat,venue)
-    reg=PoissonRegressor(alpha=1.0,max_iter=500,tol=1e-6).fit(X,y)
+    reg=PoissonRegressor(alpha=best,max_iter=1000,tol=1e-7).fit(X,y)
     tc,tv,_=goal_features(te)
     lambdas=np.clip(reg.predict(matrix(enc,tc,tv)),0.05,7.0).reshape(-1,2)
     predicted=[probs(h,a) for h,a in lambdas]
@@ -59,12 +80,19 @@ def main():
     bp=np.array([[row[bc.index(l)] for l in LABELS] for row in bp0])
     report={'version':'0.3 research prototype','train_matches':len(tr),'test_matches':len(te),
             'poisson':scores(labels,p),'elo_logistic_02':scores(labels,bp),
-            'model':'Regularized Poisson goals regression; no Dixon-Coles adjustment yet',
+            'model':'Poisson goals regression; regularization chosen on 2023/24 -> 2024/25 validation; no Dixon-Coles',
+            'selected_alpha':best,'alpha_validation':validation,
+            'diagnostics':{'predicted_home_wins':int((p.argmax(axis=1)==0).sum()),
+                           'predicted_draws':int((p.argmax(axis=1)==1).sum()),
+                           'predicted_away_wins':int((p.argmax(axis=1)==2).sum()),
+                           'expected_home_goals_std':float(lambdas[:,0].std()),
+                           'expected_away_goals_std':float(lambdas[:,1].std())},
             'limitations':['Season holdout 2025/26 is reused from 0.2: not an independent untouched test.',
               'New/promoted teams have unseen categorical coefficients; evaluate them separately.',
               'No injuries, xG or lineup features; no claim of real-time forecasts.',
               'Over/under and BTTS have no independently validated market-odds backtest here.',
-              'Odds availability/timing not verified; no profitable-betting claim.']}
+              'Odds availability/timing not verified; no profitable-betting claim.',
+              'Tuning is exploratory; 2025/26 has been inspected in previous versions and is not untouched.']}
     OUT.mkdir(exist_ok=True)
     (OUT/'metrics_v03.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
     rows=[]
