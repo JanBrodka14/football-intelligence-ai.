@@ -33,9 +33,20 @@ jobs:
       - name: Download results and upcoming fixtures
         if: steps.localtime.outputs.run == 'true'
         run: python download_data.py
+      - name: Fetch API-FOOTBALL upcoming fixtures
+        if: steps.localtime.outputs.run == 'true'
+        env:
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+        run: python api_football.py fixtures
       - name: Generate and settle immutable forecasts
         if: steps.localtime.outputs.run == 'true'
         run: python live_forecast.py
+      - name: Fetch API-FOOTBALL pre-match odds
+        if: steps.localtime.outputs.run == 'true'
+        env:
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          MAX_ODDS_CALLS: "35"
+        run: python api_football.py odds
       - name: Screen available odds and create AKO candidate report
         if: steps.localtime.outputs.run == 'true'
         run: python odds_selection.py
@@ -57,4 +68,5 @@ jobs:
           path: |
             output/daily_report.*
             output/coupon_candidates.*
+            output/api_*.json
           if-no-files-found: warn
