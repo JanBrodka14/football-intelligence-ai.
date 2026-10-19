@@ -1,0 +1,60 @@
+name: Football AI 0.5 - daily forecasts
+on:
+  schedule:
+    - cron: '0 7,8 * * *' # 09:00 Warsaw with DST guard below
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: football-ai-daily
+  cancel-in-progress: false
+jobs:
+  daily:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 7,8 * * *'
+    steps:
+      - name: Check Warsaw 09:00 (DST-aware)
+        id: localtime
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$(TZ=Europe/Warsaw date +%H)" = "09" ]; then echo 'run=true' >> "$GITHUB_OUTPUT"; else echo 'run=false' >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/checkout@v4
+        if: steps.localtime.outputs.run == 'true'
+      - uses: actions/setup-python@v5
+        if: steps.localtime.outputs.run == 'true'
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        if: steps.localtime.outputs.run == 'true'
+        run: python -m pip install -r requirements.txt
+      - name: Unit tests
+        if: steps.localtime.outputs.run == 'true'
+        run: python -m unittest discover -s tests -v
+      - name: Download results and upcoming fixtures
+        if: steps.localtime.outputs.run == 'true'
+        run: python download_data.py
+      - name: Generate and settle immutable forecasts
+        if: steps.localtime.outputs.run == 'true'
+        run: python live_forecast.py
+      - name: Screen available odds and create AKO candidate report
+        if: steps.localtime.outputs.run == 'true'
+        run: python odds_selection.py
+      - name: Save forecast ledger
+        if: steps.localtime.outputs.run == 'true'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add live_predictions.csv
+          if ! git diff --cached --quiet; then
+            git commit -m 'Record daily pre-match forecasts and settled results'
+            git push
+          fi
+      - name: Upload daily report
+        if: steps.localtime.outputs.run == 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: football-ai-daily
+          path: |
+            output/daily_report.*
+            output/coupon_candidates.*
+          if-no-files-found: warn
