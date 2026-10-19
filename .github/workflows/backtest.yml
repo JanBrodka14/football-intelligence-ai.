@@ -1,11 +1,12 @@
-name: Football AI - historical backtest
+name: Football AI v0.4 - audited backtest
 
 on:
   workflow_dispatch:
 
 jobs:
-  backtest:
-    runs-on: ubuntu-latest
+  research:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -15,20 +16,24 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt
 
-      - name: Download historical data
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Audit forecast registry
+        run: python audit_registry.py
+
+      - name: Download historical results
         run: python download_data.py
 
-      - name: Run v0.2 baseline
+      - name: Research backtest
         run: python backtest.py
 
-      - name: Run v0.3 Poisson comparison
-        run: python poisson_backtest.py
-
-      - name: Upload results
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: football-ai-backtest-v03
+          name: football-ai-v04-research
           path: output/
+          if-no-files-found: warn
