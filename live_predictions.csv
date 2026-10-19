@@ -1,0 +1,1 @@
+forecast_id,created_utc,match_date,league,home,away,p_home,p_draw,p_away,p_over_2_5,p_under_2_5,p_btts_yes,p_btts_no,elo_p_home,elo_p_draw,elo_p_away,selection,confidence,result,home_goals,away_goals,settled_utc
