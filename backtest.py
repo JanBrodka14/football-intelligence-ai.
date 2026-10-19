@@ -1,122 +1,230 @@
-"""Chronological 1X2 evaluation, historical odds, and fixed-stake paper betting."""
+"""Football Intelligence AI 0.4: research-only, reproducible historical evaluation.
+No live forecast or bookmaker edge is implied.
+"""
 import csv
 import datetime as dt
 import json
-from pathlib import Path
 from collections import defaultdict
+from pathlib import Path
 import numpy as np
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score
+from scipy.stats import poisson
+from sklearn.linear_model import LogisticRegression, PoissonRegressor
+from sklearn.preprocessing import OneHotEncoder
 
 ROOT = Path(__file__).resolve().parent
-TRAIN = {'2324', '2425'}
-TEST = {'2526'}
-LABELS = ['H', 'D', 'A']
-ODDS_SETS = [('B365H','B365D','B365A'), ('AvgH','AvgD','AvgA'), ('MaxH','MaxD','MaxA')]
+OUT = ROOT / 'output'
+LABELS = ('H', 'D', 'A')
+TRAIN_SEASONS = ('2324', '2425')
+TEST_SEASON = '2526'  # Reused diagnostic test, NOT untouched holdout.
+ODDS_SETS = (('B365H','B365D','B365A'), ('AvgH','AvgD','AvgA'), ('MaxH','MaxD','MaxA'))
 
-def parse_date(s):
+
+def date_of(s):
     for fmt in ('%d/%m/%Y','%d/%m/%y','%Y-%m-%d'):
-        try: return dt.datetime.strptime(s.strip(),fmt).date()
-        except ValueError: pass
+        try:
+            return dt.datetime.strptime(s.strip(), fmt).date()
+        except (ValueError, AttributeError):
+            pass
     return None
 
-def valid_odds(row):
-    for cols in ODDS_SETS:
+
+def load(root=ROOT):
+    matches = []
+    for f in sorted((root / 'data').glob('*.csv')):
         try:
-            values=[float(row[k]) for k in cols]
-            if all(np.isfinite(v) and v > 1.0 for v in values):
-                return dict(zip(LABELS,values)), '/'.join(cols)
-        except (KeyError,ValueError,TypeError): pass
-    return None, None
-
-def load():
-    games=[]
-    for f in sorted((ROOT/'data').glob('*.csv')):
-        try: season,league=f.stem.split('_',1)
-        except ValueError: continue
-        if season not in TRAIN|TEST: continue
-        with f.open(encoding='utf-8-sig',errors='replace',newline='') as handle:
+            season, league = f.stem.split('_', 1)
+        except ValueError:
+            continue
+        if season not in set(TRAIN_SEASONS) | {TEST_SEASON}:
+            continue
+        with f.open(encoding='utf-8-sig', errors='replace', newline='') as handle:
             for row in csv.DictReader(handle):
-                date=parse_date(row.get('Date',''))
-                if not date or row.get('FTR') not in LABELS or not row.get('HomeTeam') or not row.get('AwayTeam'): continue
-                try: hg,ag=int(row['FTHG']),int(row['FTAG'])
-                except (ValueError,TypeError): continue
-                odds,source=valid_odds(row)
-                games.append(dict(date=date,season=season,league=league,home=row['HomeTeam'].strip(),away=row['AwayTeam'].strip(),result=row['FTR'],hg=hg,ag=ag,odds=odds,odds_source=source))
-    return sorted(games,key=lambda x:(x['date'],x['league'],x['home']))
+                date = date_of(row.get('Date', ''))
+                if date is None or row.get('FTR') not in LABELS or not row.get('HomeTeam') or not row.get('AwayTeam'):
+                    continue
+                try:
+                    hg, ag = int(row['FTHG']), int(row['FTAG'])
+                except (TypeError, ValueError):
+                    continue
+                if hg < 0 or ag < 0 or (hg > ag and row['FTR'] != 'H') or (hg == ag and row['FTR'] != 'D') or (hg < ag and row['FTR'] != 'A'):
+                    continue
+                odds, source = None, None
+                for columns in ODDS_SETS:
+                    try:
+                        vals = [float(row[c]) for c in columns]
+                        if all(np.isfinite(v) and v > 1 for v in vals):
+                            odds, source = vals, '/'.join(columns)
+                            break
+                    except (KeyError, ValueError, TypeError):
+                        pass
+                matches.append(dict(date=date, season=season, league=league,
+                                    home=row['HomeTeam'].strip(), away=row['AwayTeam'].strip(),
+                                    hg=hg, ag=ag, result=row['FTR'], odds=odds, odds_source=source))
+    return sorted(matches, key=lambda m: (m['date'], m['league'], m['home'], m['away']))
 
-def features(games):
-    elo=defaultdict(lambda:1500.0); form=defaultdict(list)
-    X=[]; Y=[]
-    for m in games:
-        h=(m['league'],m['home']);a=(m['league'],m['away'])
-        eh,ea=elo[h],elo[a];fh,fa=form[h][-5:],form[a][-5:]
-        avg=lambda x,j:sum(v[j] for v in x)/len(x) if x else 1.3
-        X.append([eh-ea,avg(fh,0)-avg(fa,0),avg(fh,1)-avg(fa,1),len(fh),len(fa)])
-        Y.append(m['result'])
-        expected=1/(1+10**((ea-eh-65)/400))
-        actual={'H':1,'D':0.5,'A':0}[m['result']]
-        delta=22*(actual-expected)
-        elo[h]+=delta;elo[a]-=delta
-        form[h].append((m['hg'],m['ag']));form[a].append((m['ag'],m['hg']))
-    return np.asarray(X),np.asarray(Y)
 
-def scores(y,p):
-    oh=np.array([[float(v==lab) for lab in LABELS] for v in y])
-    # Explicit H,D,A ordering avoids sklearn.log_loss alphabetical-label mismatch.
-    return dict(accuracy=float(accuracy_score(y,np.asarray(LABELS)[p.argmax(1)])),
-                multiclass_brier=float(np.mean(np.sum((p-oh)**2,axis=1))),
-                log_loss=float(-np.mean(np.sum(oh*np.log(np.clip(p,1e-15,1)),axis=1))))
+def elo_features(games):
+    """All fixtures on a calendar day are scored BEFORE any same-day result updates."""
+    elo = defaultdict(lambda: 1500.)
+    form = defaultdict(list)
+    x = np.zeros((len(games), 5))
+    cursor = 0
+    while cursor < len(games):
+        end = cursor
+        while end < len(games) and games[end]['date'] == games[cursor]['date']:
+            end += 1
+        for i in range(cursor, end):
+            m = games[i]
+            h, a = (m['league'], m['home']), (m['league'], m['away'])
+            fh, fa = form[h][-5:], form[a][-5:]
+            avg = lambda v, j: sum(z[j] for z in v) / len(v) if v else 1.3
+            x[i] = [elo[h]-elo[a], avg(fh,0)-avg(fa,0), avg(fh,1)-avg(fa,1), len(fh), len(fa)]
+        for i in range(cursor, end):
+            m = games[i]
+            h, a = (m['league'], m['home']), (m['league'], m['away'])
+            eh, ea = elo[h], elo[a]
+            expected = 1 / (1 + 10**((ea-eh-65)/400))
+            actual = {'H':1., 'D':.5, 'A':0.}[m['result']]
+            change = 22 * (actual - expected)
+            elo[h] += change
+            elo[a] -= change
+            form[h].append((m['hg'], m['ag']))
+            form[a].append((m['ag'], m['hg']))
+        cursor = end
+    return x
+
+
+def goal_rows(matches):
+    cats, venues, targets = [], [], []
+    for m in matches:
+        home, away = m['league']+'|'+m['home'], m['league']+'|'+m['away']
+        cats.extend(((home,away), (away,home)))
+        venues.extend((1,0))
+        targets.extend((m['hg'],m['ag']))
+    return cats, np.array(venues), np.array(targets)
+
+
+def goal_matrix(enc, cats, venue):
+    from scipy.sparse import hstack, csr_matrix
+    return hstack([enc.transform(cats), csr_matrix(venue.reshape(-1,1))], format='csr')
+
+
+def fit_goals(matches, alpha):
+    cats, venue, y = goal_rows(matches)
+    enc = OneHotEncoder(handle_unknown='ignore')
+    enc.fit(cats)
+    model = PoissonRegressor(alpha=alpha, max_iter=1000, tol=1e-6)
+    model.fit(goal_matrix(enc,cats,venue), y)
+    return enc, model
+
+
+def goal_means(fitted, matches):
+    enc, model = fitted
+    cats, venue, _ = goal_rows(matches)
+    return np.clip(model.predict(goal_matrix(enc,cats,venue)), .05, 7.).reshape(-1,2)
+
+
+def outcome_probs(lh, la, rho=0.):
+    # Explicit finite grid and normalization; residual mass above 16 is negligible for lambda<=7.
+    ph = poisson.pmf(np.arange(17), lh)
+    pa = poisson.pmf(np.arange(17), la)
+    grid = np.outer(ph,pa)
+    # Dixon-Coles low-score adjustment (rho chosen exclusively on validation season).
+    grid[0,0] *= 1-lh*la*rho
+    grid[0,1] *= 1+lh*rho
+    grid[1,0] *= 1+la*rho
+    grid[1,1] *= 1-rho
+    if np.min(grid) < 0:
+        raise ValueError('Invalid Dixon-Coles rho for goal rates')
+    grid /= grid.sum()
+    one_x_two = np.array([np.tril(grid,-1).sum(), np.trace(grid), np.triu(grid,1).sum()])
+    under = float(sum(grid[i,j] for i in range(3) for j in range(3-i)))
+    btts = float(grid[1:,1:].sum())
+    return one_x_two, under, btts
+
+
+def score(y, p):
+    p = np.asarray(p, dtype=float)
+    assert p.ndim == 2 and p.shape[1] == 3 and np.allclose(p.sum(axis=1),1,atol=1e-8)
+    truth = np.array([[int(v == label) for label in LABELS] for v in y])
+    return dict(accuracy=float(np.mean(np.array(LABELS)[p.argmax(axis=1)] == y)),
+                multiclass_brier=float(np.mean(np.sum((p-truth)**2,axis=1))),
+                log_loss=float(-np.mean(np.sum(truth*np.log(np.clip(p,1e-15,1)),axis=1))),
+                actual_draw_rate=float(np.mean(np.asarray(y)=='D')),
+                mean_predicted_draw=float(np.mean(p[:,1])),
+                top_pick_draws=int(np.sum(p.argmax(axis=1)==1)))
+
+
+def evaluate(games):
+    train = [m for m in games if m['season'] in TRAIN_SEASONS]
+    test = [m for m in games if m['season'] == TEST_SEASON]
+    inner_train = [m for m in train if m['season'] == TRAIN_SEASONS[0]]
+    inner_valid = [m for m in train if m['season'] == TRAIN_SEASONS[1]]
+    if min(len(inner_train),len(inner_valid),len(test)) < 100:
+        raise ValueError('Insufficient training, validation or test rows')
+    # Select BOTH Poisson alpha and DC rho using only 2024/25.
+    val_y = np.array([m['result'] for m in inner_valid])
+    trials = []
+    for alpha in (.0001,.001,.01,.1):
+        model = fit_goals(inner_train, alpha)
+        mu = goal_means(model, inner_valid)
+        for rho in (-.1,-.05,0.,.01,.02):
+            probabilities = np.array([outcome_probs(h,a,rho)[0] for h,a in mu])
+            metrics = score(val_y, probabilities)
+            trials.append(dict(alpha=alpha,rho=rho,validation_log_loss=metrics['log_loss']))
+    best = min(trials,key=lambda t:t['validation_log_loss'])
+    mu = goal_means(fit_goals(train,best['alpha']),test)
+    goal_p = [outcome_probs(h,a,best['rho']) for h,a in mu]
+    poisson_p = np.array([v[0] for v in goal_p])
+    # Elo is computed on ordered past match outcomes only; same-day outcomes excluded.
+    x = elo_features(games)
+    tr_idx = [i for i,m in enumerate(games) if m['season'] in TRAIN_SEASONS]
+    te_idx = [i for i,m in enumerate(games) if m['season'] == TEST_SEASON]
+    y = np.array([m['result'] for m in games])
+    elo_model = LogisticRegression(max_iter=1500).fit(x[tr_idx],y[tr_idx])
+    raw = elo_model.predict_proba(x[te_idx])
+    elo_p = raw[:,[list(elo_model.classes_).index(c) for c in LABELS]]
+    market_y, market_p = [], []
+    rows = []
+    for i,m in enumerate(test):
+        if m['odds']:
+            implied = 1/np.array(m['odds'])
+            market_y.append(m['result'])
+            market_p.append(implied/implied.sum())
+        rows.append(dict(date=str(m['date']),league=m['league'],home=m['home'],away=m['away'],
+                         result=m['result'],home_goals=m['hg'],away_goals=m['ag'],
+                         expected_home_goals=float(mu[i,0]),expected_away_goals=float(mu[i,1]),
+                         p_home=float(poisson_p[i,0]),p_draw=float(poisson_p[i,1]),p_away=float(poisson_p[i,2]),
+                         p_under_2_5=float(goal_p[i][1]),p_over_2_5=float(1-goal_p[i][1]),
+                         p_btts_yes=float(goal_p[i][2]),p_btts_no=float(1-goal_p[i][2]),
+                         baseline_p_home=float(elo_p[i,0]),baseline_p_draw=float(elo_p[i,1]),baseline_p_away=float(elo_p[i,2])))
+    report = dict(version='0.4 research release',training_matches=len(train),test_matches=len(test),
+                  selected_alpha=best['alpha'],selected_rho=best['rho'],
+                  tuning_metric='1X2 log loss, 2024/25 validation only',
+                  validation_trials=trials,
+                  poisson_dc=score(y[te_idx],poisson_p),elo_baseline=score(y[te_idx],elo_p),
+                  market=dict(matches_with_odds=len(market_y),
+                              metrics=score(np.array(market_y),np.array(market_p)) if market_y else None),
+                  limitations=[
+                      '2025/26 was inspected repeatedly in previous versions: diagnostic, NOT independent holdout.',
+                      'Model selection based on 2025/26 results is prohibited.',
+                      'Dixon-Coles rho and alpha selected on 2024/25; validation is not out-of-sample for model selection.',
+                      'Poisson team identity features cannot represent newly promoted teams reliably.',
+                      'No historical as-of injury, lineup, xG, or live fixtures data.',
+                      'Bookmaker odds may be closing prices; no time-valid value betting or profitability claims.',
+                      'All historical match predictions are retrospective backtest, NOT timestamped pre-match forecasts.',
+                      'Daily ChatGPT automation is NOT connected to GitHub Actions.'])
+    return report, rows
+
 
 def main():
-    games=load()
-    X,Y=features(games)
-    tr=[i for i,m in enumerate(games) if m['season'] in TRAIN]
-    te=[i for i,m in enumerate(games) if m['season'] in TEST]
-    if len(tr)<200 or len(te)<100: raise SystemExit('Not enough matches')
-    model=LogisticRegression(max_iter=1000).fit(X[tr],Y[tr])
-    raw=model.predict_proba(X[te]); classes=list(model.classes_)
-    p=np.asarray([[row[classes.index(lab)] for lab in LABELS] for row in raw])
-    metrics={'model':'Elo + form + logistic regression (v0.2)', 'train_matches':len(tr),'test_matches':len(te),**scores(Y[te],p)}
-    # Predeclared illustrative EV thresholds, not optimized on test set.
-    thresholds=[0.0,0.03,0.05,0.10]
-    bets={str(t):[] for t in thresholds}
-    market=[]; records=[]
-    for j,idx in enumerate(te):
-        m=games[idx]; odds=m['odds']; pp=dict(zip(LABELS,p[j]))
-        rec=dict(date=str(m['date']),league=m['league'],home=m['home'],away=m['away'],result=m['result'],p_home=pp['H'],p_draw=pp['D'],p_away=pp['A'],odds_source=m['odds_source'] or '')
-        for lab in LABELS: rec['odds_'+lab.lower()]=odds[lab] if odds else ''
-        if odds:
-            implied=np.array([1/odds[lab] for lab in LABELS]); market.append((m['result'],implied/implied.sum()))
-            options=[(pp[lab]*odds[lab]-1,lab) for lab in LABELS]
-            ev,choice=max(options)
-            rec.update(best_ev=ev,best_bet=choice,best_bet_odds=odds[choice])
-            for t in thresholds:
-                if ev>t:
-                    profit=(odds[choice]-1) if m['result']==choice else -1.0
-                    bets[str(t)].append((profit,choice==m['result']))
-        else: rec.update(best_ev='',best_bet='',best_bet_odds='')
-        records.append(rec)
-    metrics['market_comparison']={'matches_with_odds':len(market),'coverage':len(market)/len(te)}
-    if market:
-        my=np.array([v[0] for v in market]); mp=np.array([v[1] for v in market])
-        metrics['market_comparison'].update(scores(my,mp))
-    metrics['paper_betting']={}
-    for t,items in bets.items():
-        profits=np.array([v[0] for v in items]); n=len(items)
-        curve=np.r_[0,profits.cumsum()] if n else np.array([0.])
-        metrics['paper_betting'][t]={'bets':n,'win_rate':float(np.mean([v[1] for v in items])) if n else None,
-          'net_units':float(profits.sum()),'roi':float(profits.mean()) if n else None,
-          'max_drawdown_units':float(np.max(np.maximum.accumulate(curve)-curve))}
-    metrics['warnings']=['Historical odds columns may be closing odds, not guaranteed available at prediction timestamp.',
-      'Odds are for evaluation only, never training features.',
-      'Positive backtest ROI is not proof of future profitability.',
-      'Thresholds are illustrative and must not be selected based on this test set.',
-      'Market baseline uses normalized implied probabilities; margin removed.']
-    out=ROOT/'output';out.mkdir(exist_ok=True)
-    (out/'metrics.json').write_text(json.dumps(metrics,indent=2,ensure_ascii=False),encoding='utf-8')
-    with (out/'historical_predictions.csv').open('w',newline='',encoding='utf-8') as f:
-        writer=csv.DictWriter(f,fieldnames=list(records[0]));writer.writeheader();writer.writerows(records)
-    print(json.dumps(metrics,indent=2,ensure_ascii=False))
+    report, rows = evaluate(load())
+    OUT.mkdir(parents=True,exist_ok=True)
+    (OUT/'metrics_v04.json').write_text(json.dumps(report,indent=2,ensure_ascii=False),encoding='utf-8')
+    with (OUT/'predictions_v04.csv').open('w',encoding='utf-8',newline='') as f:
+        writer = csv.DictWriter(f,fieldnames=list(rows[0]))
+        writer.writeheader(); writer.writerows(rows)
+    print(json.dumps({k:v for k,v in report.items() if k!='validation_trials'},indent=2,ensure_ascii=False))
 
-if __name__=='__main__': main()
+if __name__ == '__main__':
+    main()
